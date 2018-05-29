@@ -111,7 +111,11 @@ func TestClient_WAFs(t *testing.T) {
 	}
 
 	// List
-	var wafs []*WAF
+	wafs := WAFResponse{
+		WAFs:  []*WAF{},
+		Links: linksResponse{},
+		Meta:  metaResponse{},
+	}
 	record(t, "wafs/list", func(c *Client) {
 		wafs, err = c.ListWAFs(&ListWAFsInput{
 			Service: testServiceID,
@@ -121,7 +125,7 @@ func TestClient_WAFs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(wafs) < 1 {
+	if len(wafs.WAFs) < 1 {
 		t.Errorf("bad wafs: %v", wafs)
 	}
 

@@ -21,13 +21,17 @@ type WAFConfigurationSet struct {
 
 // WAF is the information about a firewall object.
 type WAF struct {
-	ID                string `jsonapi:"primary,waf"`
-	Version           int    `jsonapi:"attr,version"`
-	PrefetchCondition string `jsonapi:"attr,prefetch_condition"`
-	Response          string `jsonapi:"attr,response"`
-	LastPush          string `jsonapi:"attr,last_push"`
+	ID                        string `jsonapi:"primary,waf"`
+	Version                   int    `jsonapi:"attr,version"`
+	PrefetchCondition         string `jsonapi:"attr,prefetch_condition"`
+	Response                  string `jsonapi:"attr,response"`
+	LastPush                  string `jsonapi:"attr,last_push"`
+	Disabled                  bool   `jsonapi:"attr,disabled"`
+	RuleStatusesLogCount      int    `jsonapi:"attr,rule_statuses_log_count"`
+	RuleStatusesBlockCount    int    `jsonapi:"attr,rule_statuses_block_count"`
+	RuleStatusesDisabledCount int    `jsonapi:"attr,rule_statuses_disabled_count"`
 
-	ConfigurationSet *WAFConfigurationSet `jsonapi:"relation,configuration_set"`
+	ConfigurationSet *WAFConfigurationSet `jsonapi:"relation,configuration_set,omitempty"`
 }
 
 // wafType is used for reflection because JSONAPI wants to know what it's
@@ -41,38 +45,157 @@ type ListWAFsInput struct {
 
 	// Version is the specific configuration version (required).
 	Version int
+
+	// Filters is the ListWAFsFilterInput
+	Filters ListWAFsFilterInput
+}
+
+type ListWAFsFilterInput struct {
+	// Include is for Including relationships. Optional, comma separated values. Permitted values: configuration_set,owasp.
+	Include string
+
+	// Number is the Pagination page number.
+	PageNumber int
+
+	// Size is the Number of items to return on each paginated page.
+	MaxResults int
+}
+
+type WAFResponse struct {
+	WAFs  []*WAF
+	Links linksResponse
+	Meta  metaResponse
 }
 
 // ListWAFs returns the list of wafs for the configuration version.
-func (c *Client) ListWAFs(i *ListWAFsInput) ([]*WAF, error) {
+func (c *Client) ListWAFs(i *ListWAFsInput) (WAFResponse, error) {
+	listResponse := WAFResponse{
+		WAFs:  []*WAF{},
+		Links: linksResponse{},
+		Meta:  metaResponse{},
+	}
 	if i.Service == "" {
-		return nil, ErrMissingService
+		return listResponse, ErrMissingService
 	}
 
 	if i.Version == 0 {
-		return nil, ErrMissingVersion
+		return listResponse, ErrMissingVersion
 	}
 
+	filters := &RequestOptions{Params: i.formatListWAFsFilters()}
 	path := fmt.Sprintf("/service/%s/version/%d/wafs", i.Service, i.Version)
-	resp, err := c.Get(path, nil)
+	resp, err := c.Get(path, filters)
 	if err != nil {
-		return nil, err
+		return listResponse, err
 	}
 
-	data, err := jsonapi.UnmarshalManyPayload(resp.Body, wafType)
+	err = c.interpretWAFsPageAndMeta(&listResponse, i.Filters.PageNumber, resp)
 	if err != nil {
-		return nil, err
+		return listResponse, err
 	}
 
-	wafs := make([]*WAF, len(data))
+	// data, err := jsonapi.UnmarshalManyPayload(resp.Body, wafType)
+	// if err != nil {
+	// 	return nil, err
+	// }
+	//
+	// wafs := make([]*WAF, len(data))
+	// for i := range data {
+	// 	typed, ok := data[i].(*WAF)
+	// 	if !ok {
+	// 		return nil, fmt.Errorf("got back a non-WAF response")
+	// 	}
+	// 	wafs[i] = typed
+	// }
+	return listResponse, nil
+}
+func (c *Client) interpretWAFsPageAndMeta(answer *WAFResponse, pageNum int, received *http.Response) error {
+	// before we pull the status info out of the response body, fetch
+	// pagination info from it:
+	pages, meta, body, err := getPagesAndMeta(received.Body)
+
+	// pagesAndMeta := &WAFResponse{
+	// 	Links: linksResponse{
+	// 		Links: pages,
+	// 	},
+	// 	Meta: metaResponse{
+	// 		Meta: meta,
+	// 	},
+	// }
+	answer.Links.Links = pages
+	answer.Meta.Meta = meta
+	if err != nil {
+		return err
+	}
+	data, err := jsonapi.UnmarshalManyPayload(body, wafType)
+	if err != nil {
+		return err
+	}
+
 	for i := range data {
 		typed, ok := data[i].(*WAF)
 		if !ok {
-			return nil, fmt.Errorf("got back a non-WAF response")
+			return fmt.Errorf("got back a non-WAF response")
 		}
-		wafs[i] = typed
+		answer.WAFs = append(answer.WAFs, typed)
 	}
-	return wafs, nil
+	if pageNum == 0 {
+		if pages.Next != "" {
+			// NOTE: pages.Next URL includes filters already
+			resp, err := c.SimpleGet(pages.Next)
+			if err != nil {
+				return err
+			}
+			c.interpretWAFsPageAndMeta(answer, pageNum, resp)
+		}
+		return nil
+	}
+
+	return nil
+}
+
+// formatFilters converts user input into query parameters for filtering
+// Fastly results for rules in a WAF.
+func (i *ListWAFsInput) formatListWAFsFilters() map[string]string {
+	input := i.Filters
+
+	pairings := map[string]interface{}{
+		"include":      input.Include,
+		"page[size]":   input.MaxResults,
+		"page[number]": input.PageNumber, // starts at 1, not 0
+	}
+	// NOTE: This setup means we will not be able to send the zero value
+	// of any of these filters. It doesn't appear we would need to at present.
+
+	return pairingsToStrings(pairings)
+}
+
+func pairingsToStrings(pairings map[string]interface{}) map[string]string {
+	result := map[string]string{}
+	for key, value := range pairings {
+		switch t := reflect.TypeOf(value).String(); t {
+		case "string":
+			if value != "" {
+				result[key] = value.(string)
+			}
+		case "int":
+			if value != 0 {
+				result[key] = strconv.Itoa(value.(int))
+			}
+		case "[]int":
+			// convert ints to strings
+			toStrings := []string{}
+			values := value.([]int)
+			for _, i := range values {
+				toStrings = append(toStrings, strconv.Itoa(i))
+			}
+			// concat strings
+			if len(values) > 0 {
+				result[key] = strings.Join(toStrings, ",")
+			}
+		}
+	}
+	return result
 }
 
 // CreateWAFInput is used as input to the CreateWAF function.
@@ -711,6 +834,18 @@ func (c *Client) interpretWAFRuleStatusesPage(answer *GetWAFRuleStatusesResponse
 	return nil
 }
 
+type metaResponse struct {
+	Meta metaInfo `json:"meta"`
+}
+
+// metaInfo stores the metadata information for a litst WAFs call.
+type metaInfo struct {
+	CurrentPage int `json:"current_page,omitempty"`
+	PerPage     int `json:"per_page,omitempty"`
+	RecordCount int `json:"record_count,omitempty"`
+	TotalPages  int `json:"total_pages,omitempty"`
+}
+
 // linksResponse is used to pull the "Links" pagination fields from
 // a call to Fastly; these are excluded from the results of the jsonapi
 // call to `UnmarshalManyPayload()`, so we have to fetch them separately.
@@ -746,6 +881,25 @@ func getPages(body io.Reader) (paginationInfo, io.Reader, error) {
 	var pages linksResponse
 	json.Unmarshal(bodyBytes, &pages)
 	return pages.Links, bytes.NewReader(buf.Bytes()), nil
+}
+
+// getPages parses a response to get the pagination data without destroying
+// the reader we receive as "resp.Body"; this essentially copies resp.Body
+// and returns it so we can use it again.
+func getPagesAndMeta(body io.Reader) (paginationInfo, metaInfo, io.Reader, error) {
+	var buf bytes.Buffer
+	tee := io.TeeReader(body, &buf)
+
+	bodyBytes, err := ioutil.ReadAll(tee)
+	if err != nil {
+		return paginationInfo{}, metaInfo{}, nil, err
+	}
+
+	var meta metaResponse
+	var pages linksResponse
+	json.Unmarshal(bodyBytes, &pages)
+	json.Unmarshal(bodyBytes, &meta)
+	return pages.Links, meta.Meta, bytes.NewReader(buf.Bytes()), nil
 }
 
 // GetWAFRuleStatusInput specifies the parameters for the GetWAFRuleStatus call.
